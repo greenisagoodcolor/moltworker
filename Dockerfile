@@ -1,8 +1,13 @@
 FROM docker.io/cloudflare/sandbox:0.7.0
 
 # Install Node.js 22 (required by clawdbot)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
+# The base image has Node 20, we need to replace it with Node 22
+# Using direct binary download for reliability
+ENV NODE_VERSION=22.13.1
+RUN apt-get update && apt-get install -y xz-utils \
+    && curl -fsSL https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
     && node --version \
     && npm --version
 
