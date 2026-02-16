@@ -7,7 +7,8 @@
 # 4. Starts a background sync loop (rclone, watches for file changes)
 # 5. Starts the gateway
 
-set -e
+# Note: set -e removed intentionally — a patcher or background job failure
+# should not prevent gateway startup. Errors are logged individually.
 
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     echo "OpenClaw gateway is already running, exiting."
@@ -228,10 +229,10 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
             api: api,
             models: [{ id: modelId, name: modelId, contextWindow: 131072, maxTokens: 8192 }],
         };
-        config.agents = config.agents || {};
-        config.agents.defaults = config.agents.defaults || {};
-        config.agents.defaults.model = { primary: providerName + '/' + modelId };
-        console.log('AI Gateway model override: provider=' + providerName + ' model=' + modelId + ' via ' + baseUrl);
+        // NOTE: config.agents.defaults.model removed — the { primary: '...' } format
+        // is rejected by OpenClaw's strict config validation. The provider is still
+        // registered under config.models.providers so it can be selected in the UI.
+        console.log('AI Gateway provider registered: ' + providerName + ' model=' + modelId + ' via ' + baseUrl);
     } else {
         console.warn('CF_AI_GATEWAY_MODEL set but missing required config (account ID, gateway ID, or API key)');
     }
@@ -276,16 +277,6 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
         appToken: process.env.SLACK_APP_TOKEN,
         enabled: true,
     };
-}
-
-// ── Model configuration ──
-// Set default model to Claude Sonnet 4.5 (direct Anthropic API)
-// CF_AI_GATEWAY_MODEL override above takes precedence if set
-if (!config.agents?.defaults?.model) {
-    config.agents = config.agents || {};
-    config.agents.defaults = config.agents.defaults || {};
-    config.agents.defaults.model = { primary: 'anthropic/claude-sonnet-4-5' };
-    console.log('Default model set: anthropic/claude-sonnet-4-5');
 }
 
 // ── Cron: daily research sprint ──
@@ -342,16 +333,9 @@ try {
     console.log('Cron jobs created: daily-research (7am PT), evening-synthesis (6pm PT)');
 }
 
-// ── Cron config in main config ──
-config.cron = config.cron || {};
-config.cron.enabled = true;
-config.cron.maxConcurrentRuns = 2;
-
-// ── Workspace directory ──
-// Ensure workspace points to /root/clawd (where files are restored)
-config.agents = config.agents || {};
-config.agents.defaults = config.agents.defaults || {};
-config.agents.defaults.workspace = '/root/clawd';
+// NOTE: config.cron, config.agents.defaults.model, and
+// config.agents.defaults.workspace removed — OpenClaw's strict config
+// validation rejects these fields, preventing gateway startup.
 
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration patched successfully');
@@ -421,6 +405,8 @@ fi
 # ============================================================
 echo "Starting OpenClaw Gateway..."
 echo "Gateway will be available on port 18789"
+echo "--- Config top-level keys ---"
+node -e "const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(Object.keys(c).join(', '))" 2>/dev/null || echo "(could not read config)"
 
 rm -f /tmp/openclaw-gateway.lock 2>/dev/null || true
 rm -f "$CONFIG_DIR/gateway.lock" 2>/dev/null || true
