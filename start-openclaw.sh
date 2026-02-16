@@ -96,18 +96,18 @@ if r2_configured; then
     fi
 
     # One-time migration: move top-level skills/workspace into openclaw/ prefix
-    MIGRATION_MARKER="r2:${R2_BUCKET}/openclaw/.migrated-prefixes"
-    if ! rclone lsf "$MIGRATION_MARKER" $RCLONE_FLAGS 2>/dev/null | grep -q migrated; then
-        echo "Running one-time R2 prefix migration..."
-        # Copy any top-level files into correct prefix (additive, won't overwrite newer)
-        rclone copy "r2:${R2_BUCKET}/workspace/" "r2:${R2_BUCKET}/openclaw/workspace/" $RCLONE_FLAGS 2>/dev/null || true
-        rclone copy "r2:${R2_BUCKET}/skills/" "r2:${R2_BUCKET}/openclaw/skills/" $RCLONE_FLAGS 2>/dev/null || true
-        # Delete orphaned top-level prefixes
-        rclone purge "r2:${R2_BUCKET}/workspace/" $RCLONE_FLAGS 2>/dev/null || true
-        rclone purge "r2:${R2_BUCKET}/skills/" $RCLONE_FLAGS 2>/dev/null || true
-        # Write migration marker
-        echo "migrated $(date -Iseconds)" | rclone rcat "$MIGRATION_MARKER" $RCLONE_FLAGS
-        echo "R2 prefix migration complete"
+    # Use rclone cat (not lsf) to check marker — lsf treats file paths as directory prefixes
+    if ! rclone cat "r2:${R2_BUCKET}/openclaw/.migrated-prefixes" $RCLONE_FLAGS 2>/dev/null | grep -q migrated; then
+        echo "Running one-time R2 prefix migration (background)..."
+        # Run migration in background so it doesn't block gateway startup
+        (
+            rclone copy "r2:${R2_BUCKET}/workspace/" "r2:${R2_BUCKET}/openclaw/workspace/" $RCLONE_FLAGS 2>/dev/null || true
+            rclone copy "r2:${R2_BUCKET}/skills/" "r2:${R2_BUCKET}/openclaw/skills/" $RCLONE_FLAGS 2>/dev/null || true
+            rclone purge "r2:${R2_BUCKET}/workspace/" $RCLONE_FLAGS 2>/dev/null || true
+            rclone purge "r2:${R2_BUCKET}/skills/" $RCLONE_FLAGS 2>/dev/null || true
+            echo "migrated $(date -Iseconds)" | rclone rcat "r2:${R2_BUCKET}/openclaw/.migrated-prefixes" $RCLONE_FLAGS
+            echo "R2 prefix migration complete"
+        ) &
     fi
 else
     echo "R2 not configured, starting fresh"
