@@ -78,21 +78,36 @@ if r2_configured; then
     fi
 
     # Restore workspace
-    REMOTE_WS_COUNT=$(rclone ls "r2:${R2_BUCKET}/workspace/" $RCLONE_FLAGS 2>/dev/null | wc -l)
+    REMOTE_WS_COUNT=$(rclone ls "r2:${R2_BUCKET}/openclaw/workspace/" $RCLONE_FLAGS 2>/dev/null | wc -l)
     if [ "$REMOTE_WS_COUNT" -gt 0 ]; then
         echo "Restoring workspace from R2 ($REMOTE_WS_COUNT files)..."
         mkdir -p "$WORKSPACE_DIR"
-        rclone copy "r2:${R2_BUCKET}/workspace/" "$WORKSPACE_DIR/" $RCLONE_FLAGS -v 2>&1 || echo "WARNING: workspace restore failed with exit code $?"
+        rclone copy "r2:${R2_BUCKET}/openclaw/workspace/" "$WORKSPACE_DIR/" $RCLONE_FLAGS -v 2>&1 || echo "WARNING: workspace restore failed with exit code $?"
         echo "Workspace restored"
     fi
 
     # Restore skills
-    REMOTE_SK_COUNT=$(rclone ls "r2:${R2_BUCKET}/skills/" $RCLONE_FLAGS 2>/dev/null | wc -l)
+    REMOTE_SK_COUNT=$(rclone ls "r2:${R2_BUCKET}/openclaw/skills/" $RCLONE_FLAGS 2>/dev/null | wc -l)
     if [ "$REMOTE_SK_COUNT" -gt 0 ]; then
         echo "Restoring skills from R2 ($REMOTE_SK_COUNT files)..."
         mkdir -p "$SKILLS_DIR"
-        rclone copy "r2:${R2_BUCKET}/skills/" "$SKILLS_DIR/" $RCLONE_FLAGS -v 2>&1 || echo "WARNING: skills restore failed with exit code $?"
+        rclone copy "r2:${R2_BUCKET}/openclaw/skills/" "$SKILLS_DIR/" $RCLONE_FLAGS -v 2>&1 || echo "WARNING: skills restore failed with exit code $?"
         echo "Skills restored"
+    fi
+
+    # One-time migration: move top-level skills/workspace into openclaw/ prefix
+    MIGRATION_MARKER="r2:${R2_BUCKET}/openclaw/.migrated-prefixes"
+    if ! rclone lsf "$MIGRATION_MARKER" $RCLONE_FLAGS 2>/dev/null | grep -q migrated; then
+        echo "Running one-time R2 prefix migration..."
+        # Copy any top-level files into correct prefix (additive, won't overwrite newer)
+        rclone copy "r2:${R2_BUCKET}/workspace/" "r2:${R2_BUCKET}/openclaw/workspace/" $RCLONE_FLAGS 2>/dev/null || true
+        rclone copy "r2:${R2_BUCKET}/skills/" "r2:${R2_BUCKET}/openclaw/skills/" $RCLONE_FLAGS 2>/dev/null || true
+        # Delete orphaned top-level prefixes
+        rclone purge "r2:${R2_BUCKET}/workspace/" $RCLONE_FLAGS 2>/dev/null || true
+        rclone purge "r2:${R2_BUCKET}/skills/" $RCLONE_FLAGS 2>/dev/null || true
+        # Write migration marker
+        echo "migrated $(date -Iseconds)" | rclone rcat "$MIGRATION_MARKER" $RCLONE_FLAGS
+        echo "R2 prefix migration complete"
     fi
 else
     echo "R2 not configured, starting fresh"
@@ -260,6 +275,81 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
     };
 }
 
+// ── Model configuration ──
+// Set default model to Claude Sonnet 4.5 (direct Anthropic API)
+// CF_AI_GATEWAY_MODEL override above takes precedence if set
+if (!config.agents?.defaults?.model) {
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.model = { primary: 'anthropic/claude-sonnet-4-5' };
+    console.log('Default model set: anthropic/claude-sonnet-4-5');
+}
+
+// ── Cron: daily research sprint ──
+// Only seed cron config if no jobs exist yet (won't overwrite user edits)
+const cronPath = '/root/.openclaw/cron/jobs.json';
+const SEARCH_CMD = 'node /root/clawd/skills/cloudflare-browser/scripts/search.js';
+const FETCH_CMD = 'node /root/clawd/skills/cloudflare-browser/scripts/fetch.js';
+const cronJobs = [
+    {
+        id: 'daily-research',
+        name: 'Daily Research Sprint',
+        enabled: true,
+        schedule: { cron: '0 7 * * *', tz: 'America/Los_Angeles' },
+        session: 'isolated',
+        message: [
+            'Daily research sprint. Follow HEARTBEAT.md daily checklist.',
+            'Pick the 2-3 highest-impact open questions from MEMORY.md.',
+            'For each question:',
+            `1. Search: run \`${SEARCH_CMD} "your query"\` to find relevant sources.`,
+            `2. Read: run \`${FETCH_CMD} <url>\` on the best results to get full content.`,
+            '3. Synthesize: write findings with source URLs to /data-room/09-research/.',
+            '4. Update MEMORY.md: change status from OPEN to RESOLVED (or note what is still needed).',
+            'After research, check if data room folders 01-08 can be populated from your findings.',
+            'End by sending a 3-5 bullet Telegram summary of what you accomplished and what is still blocked.',
+        ].join(' '),
+    },
+    {
+        id: 'evening-synthesis',
+        name: 'Evening Synthesis',
+        enabled: true,
+        schedule: { cron: '0 18 * * *', tz: 'America/Los_Angeles' },
+        session: 'isolated',
+        message: [
+            'Evening synthesis. Review all workspace changes made today.',
+            'Cross-reference new findings against the three business plans in AGENTS.md.',
+            'Update any financial assumptions, timeline estimates, or risk assessments.',
+            'If any deliverable in /data-room/10-deliverables/ needs revision based on new data, draft the update.',
+            'Send owner a brief Telegram summary: key findings, decisions needed, and tomorrow priorities.',
+        ].join(' '),
+    },
+];
+try {
+    const cronData = JSON.parse(fs.readFileSync(cronPath, 'utf8'));
+    if (cronData.jobs && cronData.jobs.length === 0) {
+        cronData.jobs = cronJobs;
+        fs.mkdirSync('/root/.openclaw/cron', { recursive: true });
+        fs.writeFileSync(cronPath, JSON.stringify(cronData, null, 2));
+        console.log('Cron jobs configured: daily-research (7am PT), evening-synthesis (6pm PT)');
+    }
+} catch (e) {
+    const cronData = { version: 1, jobs: cronJobs };
+    fs.mkdirSync('/root/.openclaw/cron', { recursive: true });
+    fs.writeFileSync(cronPath, JSON.stringify(cronData, null, 2));
+    console.log('Cron jobs created: daily-research (7am PT), evening-synthesis (6pm PT)');
+}
+
+// ── Cron config in main config ──
+config.cron = config.cron || {};
+config.cron.enabled = true;
+config.cron.maxConcurrentRuns = 2;
+
+// ── Workspace directory ──
+// Ensure workspace points to /root/clawd (where files are restored)
+config.agents = config.agents || {};
+config.agents.defaults = config.agents.defaults || {};
+config.agents.defaults.workspace = '/root/clawd';
+
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration patched successfully');
 EOFPATCH
@@ -277,6 +367,20 @@ if r2_configured; then
         while true; do
             sleep 30
 
+            # ── PULL: Merge externally-uploaded files from R2 into container ──
+            # Runs EVERY cycle before push. rclone copy is additive (no deletes)
+            # so it only downloads files that are in R2 but not local.
+            # This ensures files uploaded via wrangler/API survive the push sync.
+            if [ -d "$WORKSPACE_DIR" ]; then
+                rclone copy "r2:${R2_BUCKET}/openclaw/workspace/" "$WORKSPACE_DIR/" \
+                    $RCLONE_FLAGS --exclude='skills/**' --exclude='.git/**' --exclude='node_modules/**' 2>> "$LOGFILE"
+            fi
+            if [ -d "$SKILLS_DIR" ]; then
+                rclone copy "r2:${R2_BUCKET}/openclaw/skills/" "$SKILLS_DIR/" \
+                    $RCLONE_FLAGS 2>> "$LOGFILE"
+            fi
+
+            # ── PUSH: Upload local changes to R2 ──
             CHANGED=/tmp/.changed-files
             {
                 find "$CONFIG_DIR" -newer "$MARKER" -type f -printf '%P\n' 2>/dev/null
@@ -291,13 +395,13 @@ if r2_configured; then
             if [ "$COUNT" -gt 0 ]; then
                 echo "[sync] Uploading changes ($COUNT files) at $(date)" >> "$LOGFILE"
                 rclone sync "$CONFIG_DIR/" "r2:${R2_BUCKET}/openclaw/" \
-                    $RCLONE_FLAGS --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' --exclude='.git/**' 2>> "$LOGFILE"
+                    $RCLONE_FLAGS --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' --exclude='.git/**' --exclude='workspace/**' --exclude='skills/**' 2>> "$LOGFILE"
                 if [ -d "$WORKSPACE_DIR" ]; then
-                    rclone sync "$WORKSPACE_DIR/" "r2:${R2_BUCKET}/workspace/" \
+                    rclone sync "$WORKSPACE_DIR/" "r2:${R2_BUCKET}/openclaw/workspace/" \
                         $RCLONE_FLAGS --exclude='skills/**' --exclude='.git/**' --exclude='node_modules/**' 2>> "$LOGFILE"
                 fi
                 if [ -d "$SKILLS_DIR" ]; then
-                    rclone sync "$SKILLS_DIR/" "r2:${R2_BUCKET}/skills/" \
+                    rclone sync "$SKILLS_DIR/" "r2:${R2_BUCKET}/openclaw/skills/" \
                         $RCLONE_FLAGS 2>> "$LOGFILE"
                 fi
                 date -Iseconds > "$LAST_SYNC_FILE"
